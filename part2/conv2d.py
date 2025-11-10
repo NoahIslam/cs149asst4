@@ -69,10 +69,21 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     n_tiles_c_in = in_channels // c_in_pmax
 
     # Process the images in batches
-    for b in nl.affine_range(batch_size):
-        raise RuntimeError("Please fill your implementation of computing convolution"
-                           " of X[b] with the weights W and bias b, followed by a"
-                           " maxpool and store the result in X_out[b]")
 
+    image_dim_1 = input_height * input_width
+    image_dim_2 = filter_height * filter_width * in_channels
+    out_dim = out_channels
+    for b in nl.affine_range(batch_size):
+        img_tile = nl.ndarray((image_dim_1, image_dim_2), dtype=X.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(src=X[b], dst=img_tile)
+        reshaped_img = img_tile.reshape((image_dim_1, image_dim_2))
+
+        for i in nl.affine_range(out_height):
+            for j in nl.affine_range(out_width):
+
+                input_shifted = X[b, :, i:i+filter_height, j:j+filter_width]
+
+                X_out[b] = result.reshape((out_channels, out_pool_height, out_pool_width))
+        
     return X_out
 
