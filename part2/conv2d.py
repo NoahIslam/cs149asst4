@@ -70,20 +70,112 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
     # Process the images in batches
 
-    image_dim_1 = input_height * input_width
-    image_dim_2 = filter_height * filter_width * in_channels
-    out_dim = out_channels
+    # OUT_TILE_DIM = 128
+    # IN_TILE_DIM = 128
+
+    # for b in nl.affine_range(batch_size):
+    #     for outTile in nl.affine_range(out_channels // OUT_TILE_DIM):
+    #         outStart = outTile * OUT_TILE_DIM
+            
+    #         out_accum = nl.zeros((OUT_TILE_DIM, out_height, out_width), dtype=X.dtype, buffer=nl.psum)
+            
+    #         for i in nl.affine_range(filter_height):
+    #             for j in nl.affine_range(filter_width):
+    #                 for inTile in nl.affine_range(in_channels // IN_TILE_DIM):
+    #                     inStart = inTile * IN_TILE_DIM
+                        
+    #                     X_tile = X[b, inStart:inStart+IN_TILE_DIM, i:i+out_height, j:j+out_width]
+    #                     X_sbuf = nl.ndarray(X_tile.shape, dtype=X.dtype, buffer=nl.sbuf)
+    #                     nisa.dma_copy(src=X_tile, dst=X_sbuf)
+                        
+    #                     W_tile = nl.ndarray((OUT_TILE_DIM, IN_TILE_DIM), dtype=W.dtype, buffer=nl.sbuf)
+    #                     nisa.dma_copy(src=W[outStart:outStart+OUT_TILE_DIM, inStart:inStart+IN_TILE_DIM, i, j], dst=W_tile)
+
+    #                     W_T_psum = nisa.nc_transpose(W_tile)
+    #                     W_T_sbuf = nisa.tensor_copy(W_T_psum, dtype=W.dtype)
+    #                     out_accum += nisa.nc_matmul(W_T_sbuf, X_sbuf)
+            
+    #         out_sbuf = nl.copy(out_accum, dtype=X.dtype)
+    #         nisa.dma_copy(src=out_sbuf, dst=X_out[b, outStart:outStart+OUT_TILE_DIM, :, :])
+
+    # return X_out
+
+
+    # OUT_CHANNEL_TILE_DIM = 128
+    # IN_CHANNEL_TILE_DIM = 128
+    # print(in_channels, out_channels, filter_height, filter_width)
+    # print(out_channels, out_height, out_width)
+
+    # for b in nl.affine_range(batch_size):
+    #     for outTile in nl.affine_range(out_channels // OUT_CHANNEL_TILE_DIM):
+    #         outStart = outTile * OUT_CHANNEL_TILE_DIM
+
+    #         for h in nl.affine_range(((out_height + 7) // 8)):
+    #             for w in nl.affine_range(((out_width + 7) // 8)):
+    #                 hStart = h * 8
+    #                 wStart = w * 8
+    #                 hSize = min(8, out_height - hStart)
+    #                 wSize = min(8, out_width  - wStart)
+
+    #                 out_accum = nl.zeros((OUT_CHANNEL_TILE_DIM, 8, 8), dtype=X.dtype, buffer=nl.psum)
+                    
+    #                 for i in nl.affine_range(filter_height):
+    #                     for j in nl.affine_range(filter_width):
+    #                         for inTile in nl.affine_range(in_channels // IN_CHANNEL_TILE_DIM):
+                                
+
+    #                             inStart = inTile * IN_CHANNEL_TILE_DIM
+                                
+    #                             X_tile = X[b, inStart:inStart+IN_CHANNEL_TILE_DIM, i+hStart:i+hStart+hSize, j+wStart:j+wStart+wSize]
+    #                             X_sbuf = nl.ndarray(X_tile.shape, dtype=X.dtype, buffer=nl.sbuf)
+    #                             nisa.dma_copy(src=X_tile, dst=X_sbuf)
+                                
+    #                             W_tile = nl.ndarray((OUT_CHANNEL_TILE_DIM, IN_CHANNEL_TILE_DIM), dtype=W.dtype, buffer=nl.sbuf)
+    #                             nisa.dma_copy(src=W[outStart:outStart+OUT_CHANNEL_TILE_DIM, inStart:inStart+IN_CHANNEL_TILE_DIM, i, j], dst=W_tile)
+
+    #                             W_T_psum = nisa.nc_transpose(W_tile)
+    #                             W_T_sbuf = nisa.tensor_copy(W_T_psum, dtype=W.dtype)
+    #                             out_accum += nisa.nc_matmul(W_T_sbuf, X_sbuf)
+                    
+    #                 out_sbuf = nl.copy(out_accum, dtype=X.dtype)
+    #                 nisa.dma_copy(src=out_sbuf[:, :hSize, :wSize], dst=X_out[b, outStart:outStart+OUT_CHANNEL_TILE_DIM, hStart:hStart+hSize, wStart:wStart+wSize])
+
+    # return X_out
+
+
+
+    OUT_CHANNEL_TILE_DIM = 128
+    IN_CHANNEL_TILE_DIM = 128
+    HEIGHT_TILE = 1
+
     for b in nl.affine_range(batch_size):
-        img_tile = nl.ndarray((image_dim_1, image_dim_2), dtype=X.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(src=X[b], dst=img_tile)
-        reshaped_img = img_tile.reshape((image_dim_1, image_dim_2))
+        for outTile in nl.affine_range(out_channels // OUT_CHANNEL_TILE_DIM):
+            outStart = outTile * OUT_CHANNEL_TILE_DIM
 
-        for i in nl.affine_range(out_height):
-            for j in nl.affine_range(out_width):
+            for h in nl.affine_range(out_height // HEIGHT_TILE):
+                    hStart = h * HEIGHT_TILE
 
-                input_shifted = X[b, :, i:i+filter_height, j:j+filter_width]
+                    out_accum = nl.zeros((OUT_CHANNEL_TILE_DIM, HEIGHT_TILE, out_width), dtype=X.dtype, buffer=nl.psum)
+                    
+                    for i in nl.affine_range(filter_height):
+                        for j in nl.affine_range(filter_width):
+                            for inTile in nl.affine_range(in_channels // IN_CHANNEL_TILE_DIM):
+                                
 
-                X_out[b] = result.reshape((out_channels, out_pool_height, out_pool_width))
-        
+                                inStart = inTile * IN_CHANNEL_TILE_DIM
+                                
+                                X_tile = X[b, inStart:inStart+IN_CHANNEL_TILE_DIM, i+hStart:i+hStart+HEIGHT_TILE, j:j+out_width]
+                                X_sbuf = nl.ndarray(X_tile.shape, dtype=X.dtype, buffer=nl.sbuf)
+                                nisa.dma_copy(src=X_tile, dst=X_sbuf)
+                                
+                                W_tile = nl.ndarray((OUT_CHANNEL_TILE_DIM, IN_CHANNEL_TILE_DIM), dtype=W.dtype, buffer=nl.sbuf)
+                                nisa.dma_copy(src=W[outStart:outStart+OUT_CHANNEL_TILE_DIM, inStart:inStart+IN_CHANNEL_TILE_DIM, i, j], dst=W_tile)
+
+                                W_T_psum = nisa.nc_transpose(W_tile)
+                                W_T_sbuf = nisa.tensor_copy(W_T_psum, dtype=W.dtype)
+                                out_accum += nisa.nc_matmul(W_T_sbuf, X_sbuf)
+                    
+                    out_sbuf = nl.copy(out_accum, dtype=X.dtype)
+                    nisa.dma_copy(src=out_sbuf, dst=X_out[b, outStart:outStart+OUT_CHANNEL_TILE_DIM, hStart:hStart+HEIGHT_TILE, :])
+
     return X_out
-
