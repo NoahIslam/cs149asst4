@@ -67,11 +67,34 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     # Various tiling dimensions (You may want to define more of them)
     c_in_pmax = nl.tile_size.pmax
     n_tiles_c_in = in_channels // c_in_pmax
+    c_out_pmax = c_in_pmax
+    n_tiles_c_out = out_channels // c_out_pmax
+
+    # Reshape and PRE-TRANSPOSE weights ONCE (biggest optimization!)
+    W = W.reshape((n_tiles_c_out, c_out_pmax, n_tiles_c_in, c_in_pmax, filter_height, filter_width))
+
+    weight_sbuf = nl.ndarray((n_tiles_c_out, nl.par_dim(c_out_pmax), n_tiles_c_in, c_in_pmax, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
+    weight_copy = nl.ndarray((filter_height, filter_width, n_tiles_c_out, n_tiles_c_in, nl.par_dim(c_out_pmax), c_in_pmax), dtype=W.dtype, buffer=nl.sbuf)
+    w = nl.ndarray((filter_height, filter_width, n_tiles_c_out, n_tiles_c_in, nl.par_dim(c_in_pmax), c_out_pmax), dtype=W.dtype, buffer=nl.sbuf)
+
+    for c_out_tile in nl.affine_range(n_tiles_c_out):
+        nisa.dma_copy(src=W[c_out_tile], dst=weight_sbuf[c_out_tile])
+
+    for c_out_tile in nl.affine_range(n_tiles_c_out):
+        for c_in_tile in nl.affine_range(n_tiles_c_in):
+            for i in nl.affine_range(filter_height):
+                for j in nl.affine_range(filter_width):
+                    weight_copy[i, j, c_out_tile, c_in_tile, :, :] = nl.copy(weight_sbuf[c_out_tile, :, c_in_tile, :, i, j], dtype=W.dtype)
+                    tmp = nisa.nc_transpose(weight_copy[i, j, c_out_tile, c_in_tile])
+                    w[i, j, c_out_tile, c_in_tile] = nl.copy(tmp, dtype=W.dtype)
+
+
 
 
 
     # Process the images in batches
 
+<<<<<<< HEAD
 
     OUT_CHANNEL_TILE_DIM = 128
     IN_CHANNEL_TILE_DIM = 128
@@ -193,3 +216,71 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     #         - copy stuff from SBUF back to HBM
     #         HINT: Use nl.store
     #         ''';
+=======
+    for b in nl.affine_range(batch_size):
+        # Rolling input row buffer: keep only filter_height rows
+        x_rows = nl.ndarray((n_tiles_c_in, nl.par_dim(c_in_pmax), filter_height, input_width), dtype=X.dtype, buffer=nl.sbuf)
+
+        # Prime the ring buffer with the first filter_height rows
+        for i in nl.affine_range(filter_height):
+            for c_in_tile in nl.affine_range(n_tiles_c_in):
+                nisa.dma_copy(src=X[b, c_in_tile*c_in_pmax:(c_in_tile+1)*c_in_pmax, i, :],
+                            dst=x_rows[c_in_tile, :, i, :])
+
+        # Stage bias for all output tiles once
+        bias_sbuf_all = nl.ndarray((n_tiles_c_out, nl.par_dim(c_out_pmax), 1), dtype=bias.dtype, buffer=nl.sbuf)
+        for c_out_tile in nl.affine_range(n_tiles_c_out):
+            nisa.dma_copy(src=bias[c_out_tile*c_out_pmax:(c_out_tile+1)*c_out_pmax],
+                        dst=bias_sbuf_all[c_out_tile, :, 0])
+        
+    
+
+        even_row = nl.zeros((128, out_width), nl.float32, buffer=nl.psum)
+        max_pool_row = nl.zeros((128, out_pool_width), nl.float32, buffer=nl.psum)
+        # Process row-by-row using rolling buffer
+        for out_row in nl.affine_range(out_height):
+
+            for c_out_tile in nl.affine_range(n_tiles_c_out):
+                # Accumulate in PSUM for this output row
+                result = nl.zeros((128, out_width), nl.float32, buffer=nl.psum)
+
+                for i in nl.affine_range(filter_height):
+                    row_slot = (out_row + i) % filter_height  # Ring buffer indexing
+                    for j in nl.affine_range(filter_width):
+                        for c_in_tile in nl.affine_range(n_tiles_c_in):
+                            result += nisa.nc_matmul(w[i, j, c_out_tile, c_in_tile, :, :],
+                                                    x_rows[c_in_tile, :, row_slot, j:j+out_width])
+
+                # Convert from PSUM and add bias
+                res_sb = nl.copy(result, dtype=X.dtype)
+                row_with_bias = nisa.tensor_tensor(res_sb, bias_sbuf_all[c_out_tile], op=np.add)
+
+                # Write row directly to HBM
+                if pool_size == 1:
+                    nisa.dma_copy(src=row_with_bias,
+                                dst=X_out[b, c_out_tile*c_out_pmax:(c_out_tile+1)*c_out_pmax, out_row, :])
+                else:
+                    if out_row % pool_size == 0:
+                        even_row = row_with_bias
+                    else:
+                        row_max = nisa.tensor_tensor(even_row, row_with_bias, op=np.maximum)
+                        pooled_row = nl.ndarray((128, out_pool_width), dtype=row_max.dtype, buffer=nl.sbuf)
+                        for pw in nl.affine_range(out_pool_width):
+                            c0 = 2 * pw
+                            c1 = c0 + 1
+                            colmax = nisa.tensor_tensor(row_max[:, c0:c0+1], row_max[:, c1:c1+1], op=np.maximum)
+                            nisa.tensor_copy(src=colmax, dst=pooled_sb[:, pw:pw+1])
+                        nisa.dma_copy(src=pooled_row,
+                                    dst=X_out[b, c_out_tile*c_out_pmax:(c_out_tile+1)*c_out_pmax, out_row//pool_size, :])
+                    
+
+            # Prefetch the next needed input row into rolling buffer
+            next_input_row = out_row + filter_height
+            if next_input_row < input_height:
+                overwrite_slot = out_row % filter_height
+                for c_in_tile in nl.affine_range(n_tiles_c_in):
+                    nisa.dma_copy(src=X[b, c_in_tile*c_in_pmax:(c_in_tile+1)*c_in_pmax, next_input_row, :],
+                                dst=x_rows[c_in_tile, :, overwrite_slot, :])
+
+    return X_out
+>>>>>>> c3ff8f8 (passes some stuff for no maxpool)
